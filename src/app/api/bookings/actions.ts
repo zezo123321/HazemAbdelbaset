@@ -257,7 +257,7 @@ export async function submitBooking(formData: FormData) {
             from: CLIENT_FROM_EMAIL,
         })
 
-        await sendEmail({
+        const clientEmail = await sendEmail({
             from: CLIENT_FROM_EMAIL,
             to: client_email,
             subject: `Booking Confirmed — ${eventType?.title || 'Meeting'}`,
@@ -269,7 +269,7 @@ export async function submitBooking(formData: FormData) {
             from: OWNER_FROM_EMAIL,
         })
 
-        await sendEmail({
+        const ownerEmail = await sendEmail({
             from: OWNER_FROM_EMAIL,
             to: getOwnerEmails(),
             subject: `New booking - ${client_name} (${booking_date} ${start_time})`,
@@ -287,6 +287,15 @@ export async function submitBooking(formData: FormData) {
             `,
             replyTo: client_email,
         });
+
+        return {
+            success: true,
+            meetLink: meeting_link,
+            emailDebug: {
+                clientEmailId: clientEmail?.id,
+                ownerEmailId: ownerEmail?.id,
+            },
+        };
     } catch (emailError: any) {
         console.error('Failed to send booking confirmation email:', emailError);
         return {

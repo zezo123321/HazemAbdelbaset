@@ -51,6 +51,7 @@ export default function Book() {
   const [submitting, setSubmitting] = useState(false)
   const [serverError, setServerError] = useState('')
   const [emailWarning, setEmailWarning] = useState('')
+  const [emailDebug, setEmailDebug] = useState(null)
   const [meetLink, setMeetLink] = useState('')
 
   useEffect(() => {
@@ -103,6 +104,7 @@ export default function Book() {
     setSubmitting(true)
     setServerError('')
     setEmailWarning('')
+    setEmailDebug(null)
 
     const fd = new FormData()
     fd.append('date', selectedDate)
@@ -118,6 +120,7 @@ export default function Book() {
 
     if (result.error) { setServerError(result.error); return }
     if (result.emailWarning) setEmailWarning(result.emailWarning)
+    if (result.emailDebug) setEmailDebug(result.emailDebug)
     setMeetLink(result.meetLink || '')
     setStep(3)
   }
@@ -595,6 +598,14 @@ export default function Book() {
                         >
                           Join Google Meet ↗
                         </a>
+                      </div>
+                    </>
+                  )}
+                  {emailDebug && (
+                    <>
+                      <div style={{ height: '1px', backgroundColor: 'var(--t07)' }} />
+                      <div style={{ fontSize: '0.7rem', color: 'var(--t28)', lineHeight: 1.6, wordBreak: 'break-all' }}>
+                        Email queued: {emailDebug.clientEmailId || 'client'} / {emailDebug.ownerEmailId || 'owner'}
                       </div>
                     </>
                   )}
