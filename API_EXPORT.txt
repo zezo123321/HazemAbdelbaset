@@ -1,0 +1,2177 @@
+﻿============================================================
+E:\OptimaTech\CMS Vibe Mix\src\app\api\auth\actions.ts
+============================================================
+
+'use server'
+
+import { revalidatePath } from 'next/cache'
+import { redirect } from 'next/navigation'
+import { createClient } from '@/utils/supabase/server'
+
+export async function login(formData: FormData) {
+    const email = formData.get('email') as string
+    const password = formData.get('password') as string
+
+    if (!email || !password) {
+        return { error: 'Email and password required' }
+    }
+
+    const supabase = await createClient()
+
+    const { error } = await supabase.auth.signInWithPassword({
+        email,
+        password,
+    })
+
+    if (error) {
+        return { error: error.message }
+    }
+
+    revalidatePath('/', 'layout')
+    redirect('/admin')
+}
+
+export async function logout() {
+    const supabase = await createClient()
+    await supabase.auth.signOut()
+
+    revalidatePath('/', 'layout')
+    redirect('/login')
+}
+
+
+============================================================
+E:\OptimaTech\CMS Vibe Mix\src\app\api\auth\google\callback\route.ts
+============================================================
+
+import { NextResponse } from 'next/server';
+import { authorizeWithCode } from '@/utils/google';
+
+export async function GET(request: Request) {
+    const { searchParams } = new URL(request.url);
+    const code = searchParams.get('code');
+
+    if (!code) {
+        return NextResponse.json({ error: 'No code provided' }, { status: 400 });
+    }
+
+    try {
+        await authorizeWithCode(code);
+        // Redirect back to integrations page on success
+        return NextResponse.redirect(new URL('/admin/integrations', request.url));
+    } catch (error) {
+        console.error('Callback Error:', error);
+        return NextResponse.json({ error: 'Failed to authorize' }, { status: 500 });
+    }
+}
+
+
+============================================================
+E:\OptimaTech\CMS Vibe Mix\src\app\api\auth\google\route.ts
+============================================================
+
+import { NextResponse } from 'next/server';
+import { getAuthUrl } from '@/utils/google';
+
+export async function GET() {
+    const url = getAuthUrl();
+    return NextResponse.redirect(url);
+}
+
+
+============================================================
+E:\OptimaTech\CMS Vibe Mix\src\app\api\bookings\actions.ts
+============================================================
+
+'use server'
+
+import { createClient } from '@/utils/supabase/server'
+import { Resend } from 'resend'
+import { BookingConfirmation } from '@/emails/BookingConfirmation'
+
+const resend = new Resend(process.env.RESEND_API_KEY)
+
+export async function getAvailableSlots(dateStr: string, durationMinutes: number, eventTypeId?: string) {
+    const supabase = await createClient();
+    const date = new Date(dateStr);
+    const dayOfWeek = date.getDay();
+
+    // 0. Fetch event type settings if provided (for buffer/limits/increments)
+    let bufferBefore = 0, bufferAfter = 0, maxPerDay: number | null = null, increment = 30, minNoticeHours = 0;
+    if (eventTypeId) {
+        const { data: et } = await supabase.from('event_types').select('buffer_before, buffer_after, max_per_day, start_time_increment, min_notice_hours').eq('id', eventTypeId).single();
+        if (et) {
+            bufferBefore = et.buffer_before || 0;
+            bufferAfter = et.buffer_after || 0;
+            maxPerDay = et.max_per_day;
+            increment = et.start_time_increment || 30;
+            minNoticeHours = et.min_notice_hours || 0;
+        }
+    }
+
+    // 0.5 Check for date overrides
+    const { data: overrides } = await supabase.from('availability_overrides').select('*').eq('date', dateStr);
+    let useOverride = false;
+    let overrideSlots: any[] = [];
+    if (overrides && overrides.length > 0) {
+        useOverride = true;
+        overrideSlots = overrides[0].slots || [];
+        if (overrideSlots.length === 0) return []; // Date marked as unavailable
+    }
+
+    // 1. Get availability for this day (or override)
+    let segments: { start_time: string; end_time: string }[] = [];
+    if (useOverride) {
+        segments = overrideSlots.map((s: any) => ({ start_time: s.start, end_time: s.end }));
+    } else {
+        const { data: availabilities } = await supabase.from('availability').select('*').eq('day_of_week', dayOfWeek);
+        if (!availabilities || availabilities.length === 0) return [];
+        segments = availabilities.map(a => ({ start_time: a.start_time, end_time: a.end_time }));
+    }
+
+    // 2. Generate all possible slots
+    const { getCairoOffset } = await import('@/utils/google');
+    const offset = getCairoOffset(new Date(dateStr));
+    const slots: string[] = [];
+    const now = new Date();
+    const minNoticeTime = new Date(now.getTime() + minNoticeHours * 60 * 60 * 1000);
+
+    for (const seg of segments) {
+        let currentTime = new Date(`${dateStr}T${seg.start_time}${offset}`);
+        const endTime = new Date(`${dateStr}T${seg.end_time}${offset}`);
+
+        while (currentTime.getTime() + durationMinutes * 60000 <= endTime.getTime()) {
+            const timeString = currentTime.toTimeString().substring(0, 5);
+            const passesNotice = currentTime > minNoticeTime;
+            if (passesNotice && !slots.includes(timeString)) {
+                slots.push(timeString);
+            }
+            currentTime = new Date(currentTime.getTime() + increment * 60000);
+        }
+    }
+
+    slots.sort();
+
+    // 2.5 Filter Google Calendar conflicts
+    // Using a separate variable instead of mutating slots (mutation via length=0/push is broken in server action)
+    let filteredSlots: string[] = [...slots];
+    try {
+        const { checkCalendarConflicts } = await import('@/utils/google');
+        filteredSlots = await checkCalendarConflicts(dateStr, slots, durationMinutes);
+    } catch (e) {
+        console.error("Google Calendar conflict check failed, continuing without it.", e);
+    }
+
+    // 3. Fetch existing local bookings
+    const { data: bookings } = await supabase.from('bookings').select('start_time, end_time').eq('booking_date', dateStr);
+
+    if (!bookings || bookings.length === 0) {
+        if (maxPerDay !== null && maxPerDay <= 0) return [];
+        return filteredSlots;
+    }
+
+
+
+    // Check max_per_day
+    if (maxPerDay !== null) {
+        const eventBookings = eventTypeId
+            ? (await supabase.from('bookings').select('id').eq('booking_date', dateStr).eq('event_type_id', eventTypeId)).data?.length || 0
+            : bookings.length;
+        if (eventBookings >= maxPerDay) return [];
+    }
+
+    // 4. Filter overlapping (with local bookings + buffer support)
+    const finalAvailableSlots = filteredSlots.filter(slot => {
+        const slotStart = new Date(`${dateStr}T${slot}:00${offset}`);
+        const slotEnd = new Date(slotStart.getTime() + durationMinutes * 60000);
+        const bufferedStart = new Date(slotStart.getTime() - bufferBefore * 60000);
+        const bufferedEnd = new Date(slotEnd.getTime() + bufferAfter * 60000);
+
+        for (const booking of bookings) {
+            const bookingStart = new Date(`${dateStr}T${booking.start_time}${offset}`);
+            const bookingEnd = new Date(`${dateStr}T${booking.end_time}${offset}`);
+
+            if (
+                (bufferedStart >= bookingStart && bufferedStart < bookingEnd) ||
+                (bufferedEnd > bookingStart && bufferedEnd <= bookingEnd) ||
+                (bufferedStart <= bookingStart && bufferedEnd >= bookingEnd)
+            ) {
+                return false;
+            }
+        }
+        return true;
+    });
+
+    return finalAvailableSlots;
+}
+
+export async function submitBooking(formData: FormData) {
+    const event_type_id = formData.get('event_type_id') as string;
+    const booking_date = formData.get('date') as string;
+    const start_time = formData.get('time') as string;
+    const duration_minutes = parseInt(formData.get('duration_minutes') as string);
+
+    // Support both old (name) and new (first_name + last_name) forms
+    const firstName = formData.get('first_name') as string || '';
+    const lastName = formData.get('last_name') as string || '';
+    const client_name = (formData.get('name') as string) || `${firstName} ${lastName}`.trim();
+    const client_email = formData.get('email') as string;
+    const notes = formData.get('notes') as string;
+
+    // Calculate end time using correct timezone offset
+    const { getCairoOffset } = await import('@/utils/google');
+    const offset = getCairoOffset(new Date(booking_date));
+    const startDate = new Date(`${booking_date}T${start_time}:00${offset}`);
+    const endDate = new Date(startDate.getTime() + duration_minutes * 60000);
+    const end_time = endDate.toTimeString().substring(0, 8);
+
+    const supabase = await createClient();
+
+    // Verify slot is still available
+    const availableSlots = await getAvailableSlots(booking_date, duration_minutes, event_type_id);
+    if (!availableSlots.includes(start_time.substring(0, 5))) {
+        return { error: 'Sorry, this time slot was just booked by someone else. Please select another.' };
+    }
+
+    // Fetch event type for title
+    const { data: eventType } = await supabase.from('event_types').select('title, description').eq('id', event_type_id).single();
+
+    // Build custom answers from questions
+    const answers: Record<string, string> = {};
+    if (notes) answers.notes = notes;
+    // Collect custom question answers
+    for (const [key, val] of formData.entries()) {
+        if (key.startsWith('question_')) {
+            answers[key] = val as string;
+        }
+    }
+
+    // Create Google Calendar Event
+    let meeting_link = 'Not generated yet';
+    let calendar_event_link = '';
+    try {
+        const { createGoogleCalendarEvent } = await import('@/utils/google');
+        const googleEvent = await createGoogleCalendarEvent({
+            title: `${eventType?.title || 'Meeting'} with ${client_name}`,
+            description: `Booked via website.\nClient: ${client_name} (${client_email})\nAnswers: ${JSON.stringify(answers)}`,
+            startTime: startDate,
+            endTime: endDate,
+            clientEmail: client_email
+        });
+        if (googleEvent?.hangoutLink) meeting_link = googleEvent.hangoutLink;
+        if (googleEvent?.htmlLink) calendar_event_link = googleEvent.htmlLink;
+        // Fallback: if no Meet link, use calendar link
+        if (meeting_link === 'Not generated yet' && calendar_event_link) {
+            meeting_link = calendar_event_link;
+        }
+    } catch (e: any) {
+        console.error("Failed to create Google Calendar event:", e?.message || e);
+    }
+
+    // Insert booking
+    const { error } = await supabase.from('bookings').insert([{
+        event_type_id,
+        booking_date,
+        start_time: `${start_time}:00`,
+        end_time,
+        client_name,
+        client_email,
+        custom_answers: answers,
+        payment_status: 'pending',
+        meeting_link
+    }]);
+
+    if (error) {
+        console.error('Booking insertion error:', error);
+        return { error: 'There was an issue processing your booking.' };
+    }
+
+    // Send confirmation email
+    try {
+        const { render } = await import('@react-email/render');
+        const emailHtml = await render(BookingConfirmation({
+            name: client_name,
+            date: booking_date,
+            time: start_time,
+            meetLink: meeting_link
+        }));
+
+        await resend.emails.send({
+            from: 'Hazem Abdelbaset <hello@hazemabdelbaset.com>',
+            to: client_email,
+            subject: `Booking Confirmed — ${eventType?.title || 'Meeting'}`,
+            html: emailHtml
+        });
+    } catch (emailError: any) {
+        console.error('Failed to send booking confirmation email:', emailError);
+    }
+
+    return { success: true, meetLink };
+}
+
+
+============================================================
+E:\OptimaTech\CMS Vibe Mix\src\app\api\bookings\test-services\route.ts
+============================================================
+
+import { NextResponse } from 'next/server';
+
+export async function GET() {
+    const results: Record<string, any> = {};
+
+    // 1. Test Google Calendar
+    try {
+        const { getAuthenticatedCalendar } = await import('@/utils/google');
+        const calendar = await getAuthenticatedCalendar();
+        if (!calendar) {
+            results.google = { status: 'FAIL', error: 'Not authenticated - no tokens' };
+        } else {
+            // Try listing 1 event to verify auth works
+            const events = await calendar.events.list({
+                calendarId: 'primary',
+                maxResults: 1,
+                timeMin: new Date().toISOString(),
+            });
+            results.google = {
+                status: 'OK',
+                calendarAccess: true,
+                nextEvent: events.data.items?.[0]?.summary || 'No upcoming events',
+            };
+        }
+    } catch (e: any) {
+        results.google = { status: 'ERROR', error: e.message, code: e.code };
+    }
+
+    // 2. Test Resend
+    try {
+        const { Resend } = await import('resend');
+        const resend = new Resend(process.env.RESEND_API_KEY);
+
+        if (!process.env.RESEND_API_KEY) {
+            results.email = { status: 'FAIL', error: 'RESEND_API_KEY not set' };
+        } else {
+            // Just verify the API key works by listing domains
+            const domains = await resend.domains.list();
+            results.email = {
+                status: 'OK',
+                apiKeyValid: true,
+                domains: domains.data?.data?.map((d: any) => d.name) || [],
+            };
+        }
+    } catch (e: any) {
+        results.email = { status: 'ERROR', error: e.message };
+    }
+
+    return NextResponse.json(results);
+}
+
+
+============================================================
+E:\OptimaTech\CMS Vibe Mix\src\app\api\bookings\test-submit.ts
+============================================================
+
+import { submitBooking } from '../actions';
+
+async function test() {
+    const formData = new FormData();
+    formData.append('event_type_id', '3fd1245f-8e9f-461e-ac7c-3796e1b96a66');
+    formData.append('date', '2026-03-12');
+    formData.append('time', '10:00');
+    formData.append('duration_minutes', '30');
+    formData.append('first_name', 'Test');
+    formData.append('last_name', 'Booking');
+    formData.append('email', 'muhammed.mekky.test@gmail.com');
+    formData.append('notes', 'This is a test');
+
+    console.log("Submitting booking...");
+    const res = await submitBooking(formData);
+    console.log("Result:", res);
+}
+
+test();
+
+
+============================================================
+E:\OptimaTech\CMS Vibe Mix\src\app\api\brief\actions.ts
+============================================================
+
+'use server'
+
+import { Resend } from 'resend'
+
+const resend = new Resend(process.env.RESEND_API_KEY)
+
+interface BriefData {
+  name: string
+  email: string
+  whatsapp?: string
+  brandName: string
+  websiteOrSocial?: string
+  country?: string
+  industry?: string
+  serviceNeeded: string
+  currentProblem: string
+  desiredFeeling?: string
+  hasLogo?: string
+  references?: string
+  timeline?: string
+  budget?: string
+  notes?: string
+}
+
+function buildBriefHtml(data: BriefData): string {
+  const row = (label: string, value: string) =>
+    value ? `<tr><td style="padding:8px 12px;font-weight:600;background:#f5f0e8;width:200px;vertical-align:top">${label}</td><td style="padding:8px 12px;border-bottom:1px solid #eee">${value}</td></tr>` : ''
+
+  return `
+    <div style="font-family:'Helvetica Neue',Arial,sans-serif;max-width:700px;margin:0 auto">
+      <div style="background:#1a1a1a;padding:32px;color:#f5f0e8">
+        <h1 style="margin:0;font-size:22px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase">New Project Brief</h1>
+        <p style="margin:8px 0 0;color:rgba(245,240,232,0.55);font-size:13px">From ${data.name} — ${data.brandName}</p>
+      </div>
+      <table style="width:100%;border-collapse:collapse;font-size:14px;line-height:1.6">
+        ${row('Name', data.name)}
+        ${row('Email', data.email)}
+        ${row('WhatsApp', data.whatsapp || '')}
+        ${row('Brand', data.brandName)}
+        ${row('Website / Social', data.websiteOrSocial || '')}
+        ${row('Country', data.country || '')}
+        ${row('Industry', data.industry || '')}
+        ${row('Service Needed', data.serviceNeeded)}
+        ${row('Current Problem', data.currentProblem.replace(/\n/g, '<br>'))}
+        ${row('Desired Feeling', data.desiredFeeling || '')}
+        ${row('Has Logo?', data.hasLogo || '')}
+        ${row('References', data.references || '')}
+        ${row('Timeline', data.timeline || '')}
+        ${row('Budget', data.budget || '')}
+        ${row('Notes', data.notes || '')}
+      </table>
+      <div style="background:#f5f0e8;padding:16px 24px;font-size:12px;color:#999;text-align:center;margin-top:1px">
+        Submitted via hazemabdelbaset.com
+      </div>
+    </div>
+  `
+}
+
+export async function submitBriefForm(data: BriefData): Promise<{ success?: boolean; error?: string }> {
+  if (!data.name || !data.email || !data.brandName || !data.serviceNeeded || !data.currentProblem) {
+    return { error: 'Required fields missing.' }
+  }
+
+  const ownerEmail = process.env.CONTACT_EMAIL || 'hello@hazemabdelbaset.com'
+
+  try {
+    await resend.emails.send({
+      from: 'Hazem Portfolio <noreply@hazemabdelbaset.com>',
+      to: ownerEmail,
+      subject: `Brief: ${data.name} — ${data.brandName} (${data.serviceNeeded})`,
+      html: buildBriefHtml(data),
+      replyTo: data.email,
+    })
+
+    await resend.emails.send({
+      from: 'Hazem Abdelbaset <hello@hazemabdelbaset.com>',
+      to: data.email,
+      subject: 'Brief Received — Let\'s Book a Meeting',
+      html: `
+        <div style="font-family:'Helvetica Neue',Arial,sans-serif;max-width:500px;margin:0 auto;padding:40px 32px">
+          <h2 style="font-size:20px;font-weight:700;margin:0 0 16px">Brief received.</h2>
+          <p style="color:#555;line-height:1.7;margin:0 0 12px">Hi ${data.name},</p>
+          <p style="color:#555;line-height:1.7;margin:0 0 24px">
+            I've received your project brief and I'll review it carefully. You can now book a meeting so we can talk through it together.
+          </p>
+          <hr style="border:none;border-top:1px solid #eee;margin:24px 0"/>
+          <p style="color:#999;font-size:12px;margin:0">Hazem Abdelbaset — Brand-Led Visual Designer</p>
+        </div>
+      `,
+    })
+  } catch (err) {
+    console.error('[BriefForm] Email send failed:', err)
+    return { error: 'Failed to send. Please try again.' }
+  }
+
+  return { success: true }
+}
+
+
+============================================================
+E:\OptimaTech\CMS Vibe Mix\src\app\api\career\actions.ts
+============================================================
+
+'use server'
+
+import { createAdminClient } from '@/utils/supabase/admin'
+import { Resend } from 'resend'
+import { CareerApplicationReply } from '@/emails/CareerApplicationReply'
+
+const resend = new Resend(process.env.RESEND_API_KEY)
+
+export async function submitCareerApplication(formData: FormData) {
+    const name = formData.get('name') as string
+    const email = formData.get('email') as string
+    const phone = formData.get('phone') as string
+    const age = formData.get('age') as string
+    const city = formData.get('city') as string
+    const university = formData.get('university') as string
+    const track = formData.get('track') as string
+    const experienceLevel = formData.get('experience_level') as string
+    const weeklyHours = formData.get('weekly_hours') as string
+    const portfolio = (formData.get('portfolio') as string) || null
+    const cvUrl = formData.get('cv_url') as string
+    const motivation = formData.get('motivation') as string
+    const toolsUsed = formData.get('tools_used') as string
+    const projectLink = (formData.get('project_link') as string) || null
+    const referralSource = formData.get('referral_source') as string
+
+    if (!name || !email || !phone || !age || !city || !university || !track || !experienceLevel || !weeklyHours || !motivation || !toolsUsed || !referralSource || !cvUrl) {
+        return { error: 'All required fields must be filled.' }
+    }
+
+    const supabase = createAdminClient()
+
+    const { error } = await supabase
+        .from('career_applications')
+        .insert([{
+            name,
+            email,
+            phone,
+            age: parseInt(age, 10),
+            city,
+            university,
+            track,
+            experience_level: experienceLevel,
+            weekly_hours: weeklyHours,
+            portfolio_url: portfolio,
+            cv_url: cvUrl,
+            motivation,
+            tools_used: toolsUsed,
+            project_link: projectLink,
+            referral_source: referralSource,
+            status: 'pending'
+        }])
+
+    if (error) {
+        console.error('Career application submission error:', error)
+        return { error: 'Failed to submit application. Please try again.' }
+    }
+
+    // Send confirmation email to applicant
+    const { data: setting } = await supabase
+        .from('email_settings')
+        .select('*')
+        .eq('source', 'career_application')
+        .single()
+
+    try {
+        const trackLabels: Record<string, string> = {
+            ai: 'AI & Prompt Engineering',
+            automation: 'Automation & No-Code',
+            vibe_coding: 'Vibe Coding',
+        }
+
+        const mailOptions: any = {
+            from: setting?.sender_email || 'Hazem Abdelbaset <career@hazemabdelbaset.com>',
+            to: email,
+            subject: setting?.subject || 'Application Received',
+        }
+
+        if (setting?.body_text?.trim()) {
+            let htmlContent = setting.body_text
+            htmlContent = htmlContent.replace(/\{\{\s*name\s*\}\}/gi, name)
+            htmlContent = htmlContent.replace(/\{\{\s*email\s*\}\}/gi, email)
+            htmlContent = htmlContent.replace(/\{\{\s*track\s*\}\}/gi, trackLabels[track] || track)
+            mailOptions.html = htmlContent
+        } else {
+            mailOptions.react = CareerApplicationReply({
+                name,
+                track: trackLabels[track] || track
+            })
+        }
+
+        await resend.emails.send(mailOptions)
+    } catch (emailError) {
+        console.error('Failed to send career application reply email:', emailError)
+    }
+
+    return { success: true }
+}
+
+
+============================================================
+E:\OptimaTech\CMS Vibe Mix\src\app\api\career\upload-cv\route.ts
+============================================================
+
+import { NextResponse } from 'next/server';
+import { createAdminClient } from '@/utils/supabase/admin';
+
+const BUCKET = 'event-uploads';
+
+export async function POST(request: Request) {
+    try {
+        const formData = await request.formData();
+        const file = formData.get('file') as File | null;
+
+        if (!file) {
+            return NextResponse.json({ error: 'No file provided' }, { status: 400 });
+        }
+
+        if (file.size > 10 * 1024 * 1024) {
+            return NextResponse.json({ error: 'File too large (max 10 MB)' }, { status: 400 });
+        }
+
+        // Only allow PDF and Word documents
+        const allowedTypes = [
+            'application/pdf',
+            'application/msword',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        ];
+
+        if (!allowedTypes.includes(file.type)) {
+            return NextResponse.json({ error: 'Only PDF and Word documents are allowed' }, { status: 400 });
+        }
+
+        const supabase = createAdminClient();
+
+        const ext = file.name.split('.').pop()?.toLowerCase() || 'pdf';
+        const filePath = `career-cvs/cv-${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+
+        const arrayBuffer = await file.arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer);
+
+        const { error: uploadError } = await supabase.storage
+            .from(BUCKET)
+            .upload(filePath, buffer, {
+                upsert: false,
+                cacheControl: '3600',
+                contentType: file.type,
+            });
+
+        if (uploadError) {
+            console.error('CV upload failed:', uploadError);
+            return NextResponse.json({ error: uploadError.message }, { status: 500 });
+        }
+
+        const { data } = supabase.storage.from(BUCKET).getPublicUrl(filePath);
+
+        return NextResponse.json({ publicUrl: data.publicUrl });
+    } catch (error) {
+        console.error('CV upload route error:', error);
+        return NextResponse.json({ error: 'Upload failed' }, { status: 500 });
+    }
+}
+
+
+============================================================
+E:\OptimaTech\CMS Vibe Mix\src\app\api\contact\actions.ts
+============================================================
+
+'use server'
+
+import { createClient } from '@/utils/supabase/server'
+import { Resend } from 'resend'
+import { ContactReply } from '@/emails/ContactReply'
+import { NewsletterWelcome } from '@/emails/NewsletterWelcome'
+import { TestimonialsReply } from '@/emails/TestimonialsReply'
+import { CaseStudyReply } from '@/emails/CaseStudyReply'
+
+const resend = new Resend(process.env.RESEND_API_KEY)
+
+export async function submitContactForm(formData: FormData) {
+    const name = formData.get('name') as string
+    const email = formData.get('email') as string
+    const message = formData.get('message') as string
+
+    if (!name || !email || !message) {
+        return { error: 'All fields are required.' }
+    }
+
+    const supabase = await createClient()
+
+    const { error } = await supabase
+        .from('contacts')
+        .insert([{ name, email, message, source: 'contact_page' }])
+
+    if (error) {
+        console.error('Contact submission error:', error)
+        return { error: 'Failed to submit form. Please try again.' }
+    }
+
+    const { data: setting } = await supabase
+        .from('email_settings')
+        .select('*')
+        .eq('source', 'contact_page')
+        .single()
+
+    try {
+        const mailOptions: any = {
+            from: setting?.sender_email || 'Hazem Abdelbaset <contact@hazemabdelbaset.com>',
+            to: email,
+            subject: setting?.subject || 'Message Received',
+        }
+
+        if (setting?.body_text?.trim()) {
+            let htmlContent = setting.body_text;
+            htmlContent = htmlContent.replace(/\{\{\s*name\s*\}\}/gi, name);
+            htmlContent = htmlContent.replace(/\{\{\s*email\s*\}\}/gi, email);
+            mailOptions.html = htmlContent;
+        } else {
+            mailOptions.react = ContactReply({ name });
+        }
+
+        await resend.emails.send(mailOptions)
+    } catch (emailError) {
+        console.error('Failed to send contact reply email:', emailError)
+    }
+
+    return { success: true }
+}
+
+export async function submitNewsletter(formData: FormData, source: string = 'newsletter') {
+    const email = formData.get('email') as string
+
+    if (!email) {
+        return { error: 'Email is required.' }
+    }
+
+    const supabase = await createClient()
+
+    // We no longer rely on unique constraint across all sources because a user 
+    // can subscribe from different sources (Data Lineage).
+    const { error } = await supabase
+        .from('subscriptions')
+        .insert([{ email, source }])
+
+    if (error) {
+        // If unique constraint is on (email, source) combination, we silently succeed
+        if (error.code === '23505') {
+            return { success: true }
+        }
+        console.error('Newsletter submission error:', error)
+        return { error: 'Failed to subscribe. Please try again.' }
+    }
+
+    try {
+        const { data: setting } = await supabase
+            .from('email_settings')
+            .select('*')
+            .eq('source', source)
+            .single()
+
+        // Decide template based on source
+        let Template = NewsletterWelcome({ source, email })
+        let subject = setting?.subject || 'Welcome to the Newsletter'
+        let from = setting?.sender_email || 'Hazem Abdelbaset <newsletter@hazemabdelbaset.com>'
+
+        if (source === 'case_studies') {
+            Template = CaseStudyReply()
+        }
+
+        const mailOptions: any = {
+            from,
+            to: email,
+            subject,
+        }
+
+        if (setting?.body_text?.trim()) {
+            let htmlContent = setting.body_text;
+            htmlContent = htmlContent.replace(/\{\{\s*email\s*\}\}/gi, email);
+            htmlContent = htmlContent.replace(/\{\{\s*source\s*\}\}/gi, source);
+            mailOptions.html = htmlContent;
+        } else {
+            mailOptions.react = Template;
+        }
+
+        await resend.emails.send(mailOptions)
+    } catch (emailError) {
+        console.error('Failed to send newsletter email:', emailError)
+    }
+
+    return { success: true }
+}
+
+export async function submitTestimonialInquiry(formData: FormData) {
+    const email = formData.get('email') as string
+
+    if (!email) {
+        return { error: 'Email is required.' }
+    }
+
+    const supabase = await createClient()
+
+    const { error } = await supabase
+        .from('contacts')
+        .insert([{ email, source: 'testimonials_talk' }])
+
+    if (error) {
+        console.error('Testimonial inquiry submission error:', error)
+        return { error: 'Failed to submit inquiry. Please try again.' }
+    }
+
+    const { data: setting } = await supabase
+        .from('email_settings')
+        .select('*')
+        .eq('source', 'testimonials_talk')
+        .single()
+
+    try {
+        const mailOptions: any = {
+            from: setting?.sender_email || 'Hazem Abdelbaset <hello@hazemabdelbaset.com>',
+            to: email,
+            subject: setting?.subject || "Let's Talk Systems",
+        }
+
+        if (setting?.body_text?.trim()) {
+            let htmlContent = setting.body_text;
+            htmlContent = htmlContent.replace(/\{\{\s*email\s*\}\}/gi, email);
+            mailOptions.html = htmlContent;
+        } else {
+            mailOptions.react = TestimonialsReply();
+        }
+
+        await resend.emails.send(mailOptions)
+    } catch (emailError) {
+        console.error('Failed to send testimonial reply email:', emailError)
+    }
+
+    return { success: true }
+}
+
+
+============================================================
+E:\OptimaTech\CMS Vibe Mix\src\app\api\octaholic-assessment\route.ts
+============================================================
+
+import { NextResponse } from 'next/server';
+import { createAdminClient } from '@/utils/supabase/admin';
+import {
+  ASSESSMENT_COMPANY,
+  ASSESSMENT_ID,
+  AssessmentQuestion,
+  getAssessmentPosition,
+} from '@/app/octaholic-assessment/assessmentData';
+
+type RawAnswer = string | number | null | undefined;
+
+type AssessmentPayload = {
+  assessmentId?: string;
+  company?: string;
+  fullName?: string;
+  email?: string;
+  phone?: string;
+  position?: string;
+  answers?: Record<string, RawAnswer>;
+};
+
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const EGYPT_MOBILE_REGEX = /^01[0125]\d{8}$/;
+
+function cleanValue(input: unknown) {
+  return typeof input === 'string' ? input.replace(/\s+/g, ' ').trim() : '';
+}
+
+function normalizeEmail(input: string) {
+  return cleanValue(input).toLowerCase();
+}
+
+function normalizePhone(input: string) {
+  return input.replace(/\D/g, '');
+}
+
+function normalizeAnswer(question: AssessmentQuestion, answer: RawAnswer) {
+  if (question.type === 'scale') {
+    const numericAnswer = typeof answer === 'number' ? answer : Number(answer);
+    if (!Number.isInteger(numericAnswer) || numericAnswer < 1 || numericAnswer > 5) {
+      return null;
+    }
+
+    return numericAnswer;
+  }
+
+  const textAnswer = cleanValue(answer);
+  if (!textAnswer) {
+    return null;
+  }
+
+  if (question.type === 'choice' && question.options && !question.options.includes(textAnswer)) {
+    return null;
+  }
+
+  return textAnswer;
+}
+
+export async function POST(request: Request) {
+  try {
+    const payload = (await request.json()) as AssessmentPayload;
+    const assessmentId = cleanValue(payload.assessmentId) || ASSESSMENT_ID;
+    const company = cleanValue(payload.company) || ASSESSMENT_COMPANY;
+    const fullName = cleanValue(payload.fullName);
+    const email = normalizeEmail(payload.email || '');
+    const phone = normalizePhone(cleanValue(payload.phone));
+    const positionId = cleanValue(payload.position);
+    const position = getAssessmentPosition(positionId);
+    const rawAnswers = payload.answers || {};
+
+    if (assessmentId !== ASSESSMENT_ID) {
+      return NextResponse.json({ error: 'Invalid assessment.' }, { status: 400 });
+    }
+
+    if (!fullName || !email || !phone || !position) {
+      return NextResponse.json(
+        { error: 'Full name, email, phone, and position are required.' },
+        { status: 400 }
+      );
+    }
+
+    if (!EMAIL_REGEX.test(email)) {
+      return NextResponse.json({ error: 'Please enter a valid email address.' }, { status: 400 });
+    }
+
+    if (!EGYPT_MOBILE_REGEX.test(phone)) {
+      return NextResponse.json(
+        { error: 'Please enter a valid Egyptian mobile number.' },
+        { status: 400 }
+      );
+    }
+
+    const answers = position.questions.map((question) => {
+      const answer = normalizeAnswer(question, rawAnswers[question.id]);
+
+      return {
+        questionId: question.id,
+        type: question.type,
+        mode: question.mode || 'standard',
+        prompt: question.prompt,
+        answer,
+      };
+    });
+
+    const missingAnswer = answers.find((answer) => answer.answer === null);
+    if (missingAnswer) {
+      return NextResponse.json(
+        { error: 'Please answer every question before submitting.' },
+        { status: 400 }
+      );
+    }
+
+    const supabase = createAdminClient();
+
+    const { data, error } = await supabase
+      .from('assessment_submissions')
+      .insert([
+        {
+          assessment_id: assessmentId,
+          company,
+          full_name: fullName,
+          email,
+          phone,
+          position: position.id,
+          position_label: position.label,
+          answers,
+          user_agent: request.headers.get('user-agent') || '',
+        },
+      ])
+      .select('id')
+      .single();
+
+    if (error) {
+      console.error('Octaholic assessment insert failed:', error);
+
+      if (error.code === '23505') {
+        return NextResponse.json(
+          { error: 'This email or phone number has already submitted the assessment.' },
+          { status: 409 }
+        );
+      }
+
+      return NextResponse.json(
+        { error: 'Unable to save your assessment right now. Please try again.' },
+        { status: 500 }
+      );
+    }
+
+    return NextResponse.json({ success: true, id: data?.id });
+  } catch (error) {
+    console.error('Octaholic assessment error:', error);
+    return NextResponse.json({ error: 'Unexpected server error. Please try again.' }, { status: 500 });
+  }
+}
+
+
+============================================================
+E:\OptimaTech\CMS Vibe Mix\src\app\api\og\workshop-share\route.tsx
+============================================================
+
+import { ImageResponse } from '@vercel/og';
+/* eslint-disable @next/next/no-img-element */
+
+export const runtime = 'edge';
+
+const DEFAULT_WORKSHOP = 'The Shopify Architect';
+const DEFAULT_SUBTITLE = 'Data-Driven Ecommerce Ecosystem';
+const DEFAULT_LABEL = '100% Free Enrollment';
+const DEFAULT_NAME = 'Program Applicant';
+const DEFAULT_TITLE = 'Shopify Operator';
+const DEFAULT_HEADLINE = 'I AM JOINING';
+const DEFAULT_DATE = 'Limited seats available now';
+const DEFAULT_TIME = 'Live online sessions + practical implementation';
+
+function cleanText(input: string | null, fallback: string, maxLength = 90) {
+  if (!input) return fallback;
+  const value = input.trim().replace(/\s+/g, ' ');
+  if (!value) return fallback;
+  if (value.length <= maxLength) return value;
+  return `${value.slice(0, maxLength - 3)}...`;
+}
+
+function safePhoto(input: string | null) {
+  const value = (input || '').trim();
+  if (!value) return '';
+  if (value.startsWith('http://') || value.startsWith('https://')) return value;
+  return '';
+}
+
+export async function GET(request: Request) {
+  const { searchParams } = new URL(request.url);
+
+  const workshop = cleanText(searchParams.get('workshop'), DEFAULT_WORKSHOP, 64);
+  const subtitle = cleanText(searchParams.get('subtitle'), DEFAULT_SUBTITLE, 64);
+  const label = cleanText(searchParams.get('price'), DEFAULT_LABEL, 42);
+  const fullName = cleanText(searchParams.get('name'), DEFAULT_NAME, 34);
+  const title = cleanText(searchParams.get('title'), DEFAULT_TITLE, 40);
+  const company = cleanText(searchParams.get('company'), '', 38);
+  const headline = cleanText(searchParams.get('headline'), DEFAULT_HEADLINE, 34).toUpperCase();
+  const date = cleanText(searchParams.get('date'), DEFAULT_DATE, 46);
+  const time = cleanText(searchParams.get('time'), DEFAULT_TIME, 56);
+  const photo = safePhoto(searchParams.get('photo'));
+
+  return new ImageResponse(
+    (
+      <div
+        style={{
+          width: '1080px',
+          height: '1080px',
+          display: 'flex',
+          position: 'relative',
+          overflow: 'hidden',
+          background: 'linear-gradient(155deg, #070604 0%, #171109 52%, #22180b 100%)',
+          fontFamily: 'Inter, system-ui, sans-serif',
+          color: '#fdf7e6',
+        }}
+      >
+        <div
+          style={{
+            position: 'absolute',
+            inset: 0,
+            background:
+              'radial-gradient(circle at 14% 0%, rgba(255,210,74,0.22), transparent 42%), radial-gradient(circle at 90% 12%, rgba(189,132,13,0.18), transparent 48%)',
+          }}
+        />
+
+        <div
+          style={{
+            position: 'absolute',
+            top: 36,
+            left: 36,
+            right: 36,
+            border: '1px solid rgba(255,214,110,0.24)',
+            borderRadius: 20,
+            padding: '22px 24px',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            background: 'rgba(0,0,0,0.26)',
+          }}
+        >
+          <div style={{ display: 'flex', flexDirection: 'column' }}>
+            <div
+              style={{
+                display: 'flex',
+                padding: '8px 14px',
+                borderRadius: 999,
+                border: '1px solid rgba(255,214,110,0.6)',
+                background: 'rgba(255,214,110,0.1)',
+                color: '#ffe7a8',
+                fontSize: 20,
+                fontWeight: 700,
+                textTransform: 'uppercase',
+                letterSpacing: '0.05em',
+                marginBottom: 10,
+              }}
+            >
+              {label}
+            </div>
+            <div style={{ display: 'flex', fontSize: 58, fontWeight: 800, lineHeight: 1, maxWidth: 630 }}>{workshop}</div>
+            <div
+              style={{
+                display: 'flex',
+                marginTop: 10,
+                fontSize: 24,
+                color: '#ffe6ab',
+                fontWeight: 600,
+                letterSpacing: '0.04em',
+                textTransform: 'uppercase',
+                maxWidth: 650,
+              }}
+            >
+              {subtitle}
+            </div>
+            <div style={{ display: 'flex', marginTop: 18, fontSize: 20, color: '#f7e7bf' }}>{date}</div>
+            <div style={{ display: 'flex', marginTop: 8, fontSize: 19, color: '#e8dcb8' }}>{time}</div>
+          </div>
+
+          <div
+            style={{
+              display: 'flex',
+              width: 340,
+              height: 340,
+              borderRadius: 999,
+              border: '7px solid rgba(255,211,71,0.95)',
+              overflow: 'hidden',
+              background: '#1f1a11',
+              alignItems: 'center',
+              justifyContent: 'center',
+            }}
+          >
+            {photo ? (
+              <img
+                src={photo}
+                alt="Attendee"
+                width={340}
+                height={340}
+                style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+              />
+            ) : (
+              <div
+                style={{
+                  display: 'flex',
+                  width: 188,
+                  height: 188,
+                  borderRadius: 999,
+                  border: '3px solid rgba(255,211,71,0.5)',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  fontSize: 24,
+                  color: '#f5de9d',
+                }}
+              >
+                YOUR PHOTO
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div
+          style={{
+            position: 'absolute',
+            left: 36,
+            right: 36,
+            bottom: 36,
+            borderRadius: 20,
+            border: '1px solid rgba(255,208,95,0.26)',
+            background: 'rgba(10,8,5,0.75)',
+            display: 'flex',
+            flexDirection: 'column',
+            padding: '26px 26px 22px',
+          }}
+        >
+          <div style={{ display: 'flex', color: '#ffd347', fontSize: 34, fontWeight: 800, textTransform: 'uppercase' }}>{headline}</div>
+          <div style={{ display: 'flex', marginTop: 14, color: '#fffaf0', fontSize: 52, fontWeight: 800, lineHeight: 1.04 }}>{fullName}</div>
+          <div style={{ display: 'flex', marginTop: 10, color: '#ffd347', fontSize: 30, fontWeight: 700 }}>{title}</div>
+          {company ? (
+            <div style={{ display: 'flex', marginTop: 8, color: '#ecddb8', fontSize: 24, fontWeight: 500 }}>{company}</div>
+          ) : null}
+
+          <div
+            style={{
+              display: 'flex',
+              marginTop: 16,
+              fontSize: 19,
+              color: '#bca97a',
+              borderTop: '1px solid rgba(255,208,95,0.18)',
+              paddingTop: 12,
+            }}
+          >
+            muhammedmekky.com/workshop
+          </div>
+        </div>
+      </div>
+    ),
+    {
+      width: 1080,
+      height: 1080,
+    }
+  );
+}
+
+
+
+============================================================
+E:\OptimaTech\CMS Vibe Mix\src\app\api\popups\route.ts
+============================================================
+
+import { createClient } from '@/utils/supabase/server';
+import { NextResponse } from 'next/server';
+
+export const revalidate = 0;
+
+export async function GET() {
+    try {
+        const supabase = await createClient();
+
+        // Fetch active popups with their fields
+        const { data: popups, error } = await supabase
+            .from('popups')
+            .select(`
+                *,
+                popup_fields (
+                    id,
+                    field_type,
+                    label,
+                    placeholder,
+                    is_required,
+                    options,
+                    sort_order
+                )
+            `)
+            .eq('is_active', true)
+            .order('created_at', { ascending: false });
+
+        if (error) {
+            console.error('Error fetching popups:', error);
+            return NextResponse.json({ popups: [] }, { status: 200 });
+        }
+
+        // Sort fields by sort_order within each popup
+        const sortedPopups = (popups || []).map(popup => ({
+            ...popup,
+            popup_fields: (popup.popup_fields || []).sort(
+                (a: { sort_order: number }, b: { sort_order: number }) => a.sort_order - b.sort_order
+            ),
+        }));
+
+        return NextResponse.json({ popups: sortedPopups });
+    } catch {
+        return NextResponse.json({ popups: [] }, { status: 200 });
+    }
+}
+
+
+============================================================
+E:\OptimaTech\CMS Vibe Mix\src\app\api\popups\submit\route.ts
+============================================================
+
+import { createClient } from '@/utils/supabase/server';
+import { NextRequest, NextResponse } from 'next/server';
+
+export async function POST(req: NextRequest) {
+    try {
+        const body = await req.json();
+        const { popup_id, data, page_url } = body;
+
+        if (!popup_id || !data) {
+            return NextResponse.json(
+                { error: 'Missing popup_id or data' },
+                { status: 400 }
+            );
+        }
+
+        const supabase = await createClient();
+
+        const { error } = await supabase
+            .from('popup_submissions')
+            .insert([{ popup_id, data, page_url: page_url || '' }]);
+
+        if (error) {
+            console.error('Error saving popup submission:', error);
+            return NextResponse.json(
+                { error: 'Failed to save submission' },
+                { status: 500 }
+            );
+        }
+
+        return NextResponse.json({ success: true });
+    } catch {
+        return NextResponse.json(
+            { error: 'Invalid request' },
+            { status: 400 }
+        );
+    }
+}
+
+
+============================================================
+E:\OptimaTech\CMS Vibe Mix\src\app\api\popups\upload-image\route.ts
+============================================================
+
+import { NextResponse } from 'next/server';
+import { createAdminClient } from '@/utils/supabase/admin';
+
+const BUCKET = 'event-uploads';
+
+export async function POST(request: Request) {
+    try {
+        const formData = await request.formData();
+        const file = formData.get('file') as File | null;
+
+        if (!file) {
+            return NextResponse.json({ error: 'No file provided' }, { status: 400 });
+        }
+
+        if (file.size > 5 * 1024 * 1024) {
+            return NextResponse.json({ error: 'File too large (max 5 MB)' }, { status: 400 });
+        }
+
+        const allowed = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/svg+xml'];
+        if (!allowed.includes(file.type)) {
+            return NextResponse.json({ error: 'Only image files (JPG, PNG, WebP, GIF, SVG) are allowed' }, { status: 400 });
+        }
+
+        const supabase = createAdminClient();
+
+        const ext = file.name.split('.').pop()?.toLowerCase() || 'jpg';
+        const filePath = `popups/popup-${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+
+        const arrayBuffer = await file.arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer);
+
+        const { error: uploadError } = await supabase.storage
+            .from(BUCKET)
+            .upload(filePath, buffer, {
+                upsert: false,
+                cacheControl: '31536000',
+                contentType: file.type,
+            });
+
+        if (uploadError) {
+            console.error('Popup image upload failed:', uploadError);
+            return NextResponse.json({ error: uploadError.message }, { status: 500 });
+        }
+
+        const { data } = supabase.storage.from(BUCKET).getPublicUrl(filePath);
+
+        return NextResponse.json({ publicUrl: data.publicUrl });
+    } catch (error) {
+        console.error('Popup upload route error:', error);
+        return NextResponse.json({ error: 'Upload failed' }, { status: 500 });
+    }
+}
+
+
+============================================================
+E:\OptimaTech\CMS Vibe Mix\src\app\api\workshop\paymob\callback\route.ts
+============================================================
+
+import { NextResponse } from 'next/server';
+import { createAdminClient } from '@/utils/supabase/admin';
+import {
+    getPaymobConfig,
+    paymobGetAuthToken,
+    paymobRetrieveTransaction,
+    verifyPaymobTransactionHmac,
+} from '@/lib/paymob';
+
+type TransactionRecord = {
+    id?: number | string;
+    success?: boolean;
+    error_occured?: boolean;
+    pending?: boolean;
+    is_voided?: boolean;
+    is_refunded?: boolean;
+    order?:
+        | number
+        | string
+        | {
+              id?: number | string;
+              merchant_order_id?: string;
+          };
+};
+
+const COURSE_TITLE = 'The Shopify Architect';
+
+function cleanText(value: unknown) {
+    return typeof value === 'string' ? value.trim() : '';
+}
+
+function asString(value: unknown) {
+    if (typeof value === 'string') return value.trim();
+    if (typeof value === 'number') return String(value);
+    return '';
+}
+
+function toBoolean(value: unknown) {
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'string') {
+        const lowered = value.toLowerCase();
+        if (lowered === 'true') return true;
+        if (lowered === 'false') return false;
+    }
+    return false;
+}
+
+function extractTransactionIdFromQuery(searchParams: URLSearchParams) {
+    return (
+        searchParams.get('id') ||
+        searchParams.get('transaction_id') ||
+        searchParams.get('txn_id') ||
+        searchParams.get('payment_id') ||
+        ''
+    ).trim();
+}
+
+function extractOrderId(transaction: TransactionRecord) {
+    if (!transaction.order) return '';
+    if (typeof transaction.order === 'number' || typeof transaction.order === 'string') {
+        return String(transaction.order);
+    }
+
+    if (transaction.order.id !== undefined && transaction.order.id !== null) {
+        return String(transaction.order.id);
+    }
+
+    return '';
+}
+
+function extractMerchantOrderId(transaction: TransactionRecord) {
+    if (!transaction.order || typeof transaction.order !== 'object') return '';
+    return cleanText(transaction.order.merchant_order_id);
+}
+
+function buildCaption(baseUrl: string) {
+    return `I just enrolled in ${COURSE_TITLE}. If you want to build a data-driven Shopify ecosystem with AI and automation, check it out: ${baseUrl} #Shopify #Ecommerce #Analytics #AI #Automation`;
+}
+
+function buildPosterUrl(origin: string, row: {
+    full_name: string;
+    job_title: string;
+    company: string;
+    headline: string;
+    photo_url: string | null;
+}) {
+    const posterUrl = new URL('/api/og/workshop-share', origin);
+    posterUrl.searchParams.set('name', row.full_name || 'Program Applicant');
+    posterUrl.searchParams.set('title', row.job_title || 'Shopify Operator');
+    posterUrl.searchParams.set('headline', row.headline || 'I am joining');
+    posterUrl.searchParams.set('workshop', COURSE_TITLE);
+    posterUrl.searchParams.set('subtitle', 'Data-Driven Ecommerce Ecosystem');
+    posterUrl.searchParams.set('price', 'Paid Enrollment');
+    posterUrl.searchParams.set('date', 'Payment Confirmed');
+    posterUrl.searchParams.set('time', 'Welcome to the program');
+
+    if (row.company) {
+        posterUrl.searchParams.set('company', row.company);
+    }
+    if (row.photo_url) {
+        posterUrl.searchParams.set('photo', row.photo_url);
+    }
+
+    return posterUrl.toString();
+}
+
+function isPaidTransaction(transaction: TransactionRecord) {
+    const success = toBoolean(transaction.success);
+    const errored = toBoolean(transaction.error_occured);
+    const pending = toBoolean(transaction.pending);
+    const isVoided = toBoolean(transaction.is_voided);
+    const isRefunded = toBoolean(transaction.is_refunded);
+
+    return success && !errored && !pending && !isVoided && !isRefunded;
+}
+
+async function findRegistrationRecord(params: {
+    merchantOrderId: string;
+    paymobOrderId: string;
+}) {
+    const supabase = createAdminClient();
+
+    if (params.merchantOrderId) {
+        const byMerchantOrder = await supabase
+            .from('workshop_registrations')
+            .select('*')
+            .eq('id', params.merchantOrderId)
+            .single();
+
+        if (byMerchantOrder.data) {
+            return byMerchantOrder.data;
+        }
+    }
+
+    if (params.paymobOrderId) {
+        const bySource = await supabase
+            .from('workshop_registrations')
+            .select('*')
+            .eq('source', `paymob_pending:${params.paymobOrderId}`)
+            .single();
+
+        if (bySource.data) {
+            return bySource.data;
+        }
+    }
+
+    return null;
+}
+
+async function finalizeRegistrationFromTransaction(transaction: TransactionRecord, origin: string) {
+    const merchantOrderId = extractMerchantOrderId(transaction);
+    const paymobOrderId = extractOrderId(transaction);
+    const registration = await findRegistrationRecord({ merchantOrderId, paymobOrderId });
+
+    if (!registration) {
+        throw new Error('No matching registration was found for this Paymob transaction.');
+    }
+
+    const supabase = createAdminClient();
+    const registrationId = String(registration.id);
+
+    if (registration.source === 'shopify_architect_paid') {
+        return { registrationId, status: 'already_paid' as const };
+    }
+
+    if (!isPaidTransaction(transaction)) {
+        await supabase
+            .from('workshop_registrations')
+            .update({ source: `paymob_failed:${paymobOrderId || 'unknown'}` })
+            .eq('id', registrationId);
+
+        return { registrationId, status: 'failed' as const };
+    }
+
+    const posterUrl = buildPosterUrl(origin, {
+        full_name: registration.full_name,
+        job_title: registration.job_title,
+        company: registration.company,
+        headline: registration.headline,
+        photo_url: registration.photo_url,
+    });
+
+    const caption = buildCaption(new URL('/workshop', origin).toString());
+
+    await supabase
+        .from('workshop_registrations')
+        .update({
+            source: 'shopify_architect_paid',
+            poster_url: posterUrl,
+            caption,
+        })
+        .eq('id', registrationId);
+
+    return { registrationId, status: 'paid' as const };
+}
+
+async function processByTransactionId(transactionId: string, origin: string) {
+    const config = getPaymobConfig();
+    if (!config.apiKey) throw new Error('PAYMOB_API_KEY is missing.');
+
+    const authToken = await paymobGetAuthToken(config.apiKey);
+    const transaction = (await paymobRetrieveTransaction(transactionId, authToken)) as TransactionRecord;
+
+    return finalizeRegistrationFromTransaction(transaction, origin);
+}
+
+export async function GET(request: Request) {
+    const origin = new URL(request.url).origin;
+    const redirectFailed = new URL('/workshop?payment=failed', origin);
+
+    try {
+        const transactionId = extractTransactionIdFromQuery(new URL(request.url).searchParams);
+
+        if (!transactionId) {
+            return NextResponse.redirect(redirectFailed);
+        }
+
+        const result = await processByTransactionId(transactionId, origin);
+
+        if (result.status === 'paid' || result.status === 'already_paid') {
+            const redirectSuccess = new URL(`/workshop/ticket/${result.registrationId}`, origin);
+            return NextResponse.redirect(redirectSuccess);
+        }
+
+        return NextResponse.redirect(redirectFailed);
+    } catch (error) {
+        console.error('Paymob callback GET error:', error);
+        return NextResponse.redirect(redirectFailed);
+    }
+}
+
+export async function POST(request: Request) {
+    try {
+        const payload = (await request.json()) as {
+            obj?: Record<string, unknown>;
+            hmac?: string;
+        };
+
+        const config = getPaymobConfig();
+
+        if (!payload?.obj || !payload.hmac) {
+            return NextResponse.json({ ok: false, error: 'Invalid callback payload.' }, { status: 400 });
+        }
+
+        if (config.hmacSecret) {
+            const isValidHmac = await verifyPaymobTransactionHmac(
+                { obj: payload.obj, hmac: payload.hmac },
+                config.hmacSecret
+            );
+
+            if (!isValidHmac) {
+                return NextResponse.json({ ok: false, error: 'Invalid HMAC signature.' }, { status: 401 });
+            }
+        }
+
+        const origin = new URL(request.url).origin;
+        const transactionId = asString(payload.obj.id);
+
+        if (transactionId) {
+            await processByTransactionId(transactionId, origin);
+        } else {
+            await finalizeRegistrationFromTransaction(payload.obj as TransactionRecord, origin);
+        }
+
+        return NextResponse.json({ ok: true });
+    } catch (error) {
+        console.error('Paymob callback POST error:', error);
+        return NextResponse.json({ ok: false }, { status: 500 });
+    }
+}
+
+
+============================================================
+E:\OptimaTech\CMS Vibe Mix\src\app\api\workshop\paymob\initialize\route.ts
+============================================================
+
+import { NextResponse } from 'next/server';
+import { createAdminClient } from '@/utils/supabase/admin';
+import {
+    getPaymobConfig,
+    paymobBuildIframeUrl,
+    paymobCreateOrder,
+    paymobCreatePaymentKey,
+    paymobGetAuthToken,
+} from '@/lib/paymob';
+
+type InitializePayload = {
+    fullName?: string;
+    email?: string;
+    phone?: string;
+    jobTitle?: string;
+    company?: string;
+    headline?: string;
+    painPoint?: string;
+    photoUrl?: string;
+};
+
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function cleanValue(input: unknown) {
+    return typeof input === 'string' ? input.trim() : '';
+}
+
+function normalizePhone(input: string) {
+    return input.replace(/\D/g, '');
+}
+
+function splitName(fullName: string) {
+    const parts = fullName.split(/\s+/).filter(Boolean);
+    if (parts.length === 0) {
+        return { firstName: 'Guest', lastName: 'User' };
+    }
+    if (parts.length === 1) {
+        return { firstName: parts[0], lastName: 'User' };
+    }
+
+    return {
+        firstName: parts[0],
+        lastName: parts.slice(1).join(' '),
+    };
+}
+
+export async function POST(request: Request) {
+    try {
+        const payload = (await request.json()) as InitializePayload;
+
+        const fullName = cleanValue(payload.fullName);
+        const email = cleanValue(payload.email);
+        const phone = cleanValue(payload.phone);
+        const phoneDigits = normalizePhone(phone);
+        const jobTitle = cleanValue(payload.jobTitle);
+        const company = cleanValue(payload.company);
+        const headline = cleanValue(payload.headline) || 'I am joining';
+        const painPoint = cleanValue(payload.painPoint);
+        const photoUrl = cleanValue(payload.photoUrl);
+
+        if (!fullName || !email || !phoneDigits || !jobTitle || !company) {
+            return NextResponse.json(
+                { error: 'Full name, email, phone, job title, and company are required.' },
+                { status: 400 }
+            );
+        }
+
+        if (!EMAIL_REGEX.test(email)) {
+            return NextResponse.json({ error: 'Please provide a valid email address.' }, { status: 400 });
+        }
+
+        if (phoneDigits.length < 10 || phoneDigits.length > 15) {
+            return NextResponse.json({ error: 'Please provide a valid phone number.' }, { status: 400 });
+        }
+
+        const config = getPaymobConfig();
+        if (!config.enabled) {
+            return NextResponse.json({ error: 'Paymob is currently disabled.' }, { status: 503 });
+        }
+
+        if (!config.apiKey || !config.integrationId || !config.iframeId) {
+            return NextResponse.json({ error: 'Paymob credentials are incomplete on the server.' }, { status: 500 });
+        }
+
+        if (!Number.isFinite(config.amountCents) || config.amountCents <= 0) {
+            return NextResponse.json(
+                { error: 'PAYMOB_COURSE_AMOUNT_CENTS is missing or invalid on the server.' },
+                { status: 500 }
+            );
+        }
+
+        const supabase = createAdminClient();
+
+        const { data: insertedRow, error: insertError } = await supabase
+            .from('workshop_registrations')
+            .insert([
+                {
+                    full_name: fullName,
+                    email,
+                    phone: phoneDigits,
+                    job_title: jobTitle,
+                    company,
+                    headline,
+                    pain_point: painPoint,
+                    photo_url: photoUrl || '',
+                    poster_url: '',
+                    caption: '',
+                    source: 'paymob_pending',
+                },
+            ])
+            .select('id')
+            .single();
+
+        if (insertError) {
+            if (insertError.code === '23505') {
+                return NextResponse.json({ error: 'This email is already registered.' }, { status: 409 });
+            }
+
+            console.error('Failed to create pending registration:', insertError);
+            return NextResponse.json({ error: 'Unable to create registration.' }, { status: 500 });
+        }
+
+        const registrationId = String(insertedRow.id);
+
+        try {
+            const authToken = await paymobGetAuthToken(config.apiKey);
+            const order = await paymobCreateOrder({
+                authToken,
+                amountCents: config.amountCents,
+                currency: config.currency,
+                merchantOrderId: registrationId,
+            });
+
+            const { firstName, lastName } = splitName(fullName);
+
+            const paymentToken = await paymobCreatePaymentKey({
+                authToken,
+                amountCents: config.amountCents,
+                currency: config.currency,
+                orderId: order.id,
+                integrationId: config.integrationId,
+                billingData: {
+                    firstName,
+                    lastName,
+                    email,
+                    phoneNumber: phoneDigits,
+                },
+            });
+
+            await supabase
+                .from('workshop_registrations')
+                .update({ source: `paymob_pending:${order.id}` })
+                .eq('id', registrationId);
+
+            const paymentUrl = paymobBuildIframeUrl(config.iframeId, paymentToken);
+
+            return NextResponse.json({
+                success: true,
+                registrationId,
+                paymentUrl,
+            });
+        } catch (paymobError) {
+            console.error('Paymob initialization failed:', paymobError);
+
+            await supabase
+                .from('workshop_registrations')
+                .update({ source: 'paymob_init_failed' })
+                .eq('id', registrationId);
+
+            const message = paymobError instanceof Error ? paymobError.message : 'Unable to initialize payment.';
+            return NextResponse.json({ error: message }, { status: 502 });
+        }
+    } catch (error) {
+        console.error('Paymob initialize route error:', error);
+        return NextResponse.json({ error: 'Unexpected server error.' }, { status: 500 });
+    }
+}
+
+
+============================================================
+E:\OptimaTech\CMS Vibe Mix\src\app\api\workshop\register\route.ts
+============================================================
+
+import { NextResponse } from 'next/server';
+import { createAdminClient } from '@/utils/supabase/admin';
+import { Resend } from 'resend';
+import WorkshopConfirmation from '@/emails/WorkshopConfirmation';
+
+type RegistrationPayload = {
+    name?: string;
+    email?: string;
+    phone?: string;
+    jobTitle?: string;
+    company?: string;
+    headline?: string;
+    caption?: string;
+    photoUrl?: string;
+    painPoint?: string;
+};
+
+const COURSE_TITLE = 'The Shopify Architect';
+const COURSE_SUBTITLE = 'Data-Driven Ecommerce Ecosystem';
+const COURSE_LABEL = '100% Free Enrollment';
+const COURSE_DATE = 'Limited seats available now';
+const COURSE_TIME = 'Live online sessions + practical implementation';
+
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function cleanValue(input: unknown) {
+    return typeof input === 'string' ? input.trim() : '';
+}
+
+function normalizePhone(input: string) {
+    return input.replace(/\D/g, '');
+}
+
+export async function POST(request: Request) {
+    try {
+        const payload = (await request.json()) as RegistrationPayload;
+        const name = cleanValue(payload.name);
+        const email = cleanValue(payload.email);
+        const phone = cleanValue(payload.phone);
+        const phoneDigits = normalizePhone(phone);
+        const jobTitle = cleanValue(payload.jobTitle);
+        const company = cleanValue(payload.company);
+        const headline = cleanValue(payload.headline);
+        const caption = cleanValue(payload.caption);
+        const photoUrl = cleanValue(payload.photoUrl);
+        const painPoint = cleanValue(payload.painPoint);
+
+        if (!name || !email || !phone || !jobTitle || !company) {
+            return NextResponse.json(
+                { error: 'Name, email, phone, job title, and company are required.' },
+                { status: 400 }
+            );
+        }
+
+        if (!EMAIL_REGEX.test(email)) {
+            return NextResponse.json({ error: 'Please enter a valid email address.' }, { status: 400 });
+        }
+
+        if (phoneDigits.length < 10 || phoneDigits.length > 15) {
+            return NextResponse.json({ error: 'Please enter a valid phone number.' }, { status: 400 });
+        }
+
+        const supabase = createAdminClient();
+
+        const origin = new URL(request.url).origin;
+        const posterUrl = new URL(`${origin}/api/og/workshop-share`);
+        posterUrl.searchParams.set('name', name);
+        posterUrl.searchParams.set('title', jobTitle);
+        posterUrl.searchParams.set('headline', headline || 'I am joining');
+        posterUrl.searchParams.set('workshop', COURSE_TITLE);
+        posterUrl.searchParams.set('subtitle', COURSE_SUBTITLE);
+        posterUrl.searchParams.set('price', COURSE_LABEL);
+        posterUrl.searchParams.set('date', COURSE_DATE);
+        posterUrl.searchParams.set('time', COURSE_TIME);
+
+        if (company) {
+            posterUrl.searchParams.set('company', company);
+        }
+        if (photoUrl) {
+            posterUrl.searchParams.set('photo', photoUrl);
+        }
+
+        const finalPosterUrl = posterUrl.toString();
+
+        const { data: insertedData, error: insertError } = await supabase
+            .from('workshop_registrations')
+            .insert([
+                {
+                    full_name: name,
+                    email,
+                    phone: phoneDigits,
+                    job_title: jobTitle,
+                    company,
+                    headline: headline || 'I am joining',
+                    pain_point: painPoint,
+                    photo_url: photoUrl,
+                    poster_url: finalPosterUrl,
+                    caption,
+                    source: 'shopify_architect_landing',
+                },
+            ])
+            .select('id')
+            .single();
+
+        if (insertError) {
+            console.error('Registration insert failed:', insertError);
+            if (insertError.code === '23505') {
+                return NextResponse.json({ error: 'This email is already registered.' }, { status: 409 });
+            }
+            return NextResponse.json(
+                { error: 'Unable to save your registration right now. Please try again.' },
+                { status: 500 }
+            );
+        }
+
+        if (process.env.RESEND_API_KEY) {
+            const resend = new Resend(process.env.RESEND_API_KEY);
+            try {
+                await resend.emails.send({
+                    from: 'Muhammed Mekky <workshop@muhammedmekky.com>',
+                    to: email,
+                    subject: `You are in: ${COURSE_TITLE}`,
+                    react: WorkshopConfirmation({
+                        name,
+                        workshopTitle: COURSE_TITLE,
+                        subtitle: COURSE_SUBTITLE,
+                        date: COURSE_DATE,
+                        time: COURSE_TIME,
+                        mode: COURSE_LABEL,
+                        posterUrl: finalPosterUrl,
+                    }),
+                });
+
+                await supabase.from('workshop_registrations').update({ email_sent: true }).eq('email', email);
+            } catch (emailError) {
+                console.error('Failed to send confirmation email:', emailError);
+            }
+        }
+
+        try {
+            const whatsappUrl = new URL(`${origin}/api/workshop/send-poster`);
+            whatsappUrl.searchParams.set('name', name);
+            whatsappUrl.searchParams.set('phone', phoneDigits);
+            whatsappUrl.searchParams.set('posterUrl', finalPosterUrl);
+            if (photoUrl) {
+                whatsappUrl.searchParams.set('photoUrl', photoUrl);
+            }
+
+            const waRes = await fetch(whatsappUrl.toString(), { method: 'GET' });
+
+            if (waRes.ok) {
+                await supabase.from('workshop_registrations').update({ whatsapp_sent: true }).eq('email', email);
+            }
+        } catch (waError) {
+            console.error('Failed to trigger WhatsApp send:', waError);
+        }
+
+        return NextResponse.json({ success: true, posterUrl: finalPosterUrl, id: insertedData?.id });
+    } catch (error) {
+        console.error('Registration error:', error);
+        return NextResponse.json({ error: 'Unexpected server error. Please try again.' }, { status: 500 });
+    }
+}
+
+
+============================================================
+E:\OptimaTech\CMS Vibe Mix\src\app\api\workshop\send-poster\route.ts
+============================================================
+
+import { NextResponse } from 'next/server';
+
+const EVOLUTION_API_URL =
+    process.env.EVOLUTION_API_URL || 'http://evo-sgwcco4kw80sckwg4c08sgk4.72.62.50.238.sslip.io';
+const EVOLUTION_API_KEY = process.env.EVOLUTION_API_KEY || '';
+const EVOLUTION_INSTANCE_NAME = process.env.EVOLUTION_INSTANCE_NAME || 'mekky2';
+
+const COURSE_TITLE = 'The Shopify Architect';
+const COURSE_SUBTITLE = 'Data-Driven Ecommerce Ecosystem';
+const COURSE_DATE = 'Limited seats available now';
+const COURSE_TIME = 'Live online sessions + practical implementation';
+const COURSE_MODE = '100% Free Enrollment';
+
+function formatPhoneNumber(phone: string): string {
+    let cleaned = phone.replace(/\D/g, '');
+    if (cleaned.startsWith('0')) {
+        cleaned = `20${cleaned.substring(1)}`;
+    }
+    if (!cleaned.startsWith('20') && cleaned.length === 10) {
+        cleaned = `20${cleaned}`;
+    }
+    return cleaned;
+}
+
+async function fetchImageAsBase64(url: string, includePrefix = false): Promise<string | null> {
+    try {
+        const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+        if (!res.ok) return null;
+        const buf = await res.arrayBuffer();
+        const b64 = Buffer.from(buf).toString('base64');
+        if (includePrefix) {
+            const ct = res.headers.get('content-type') || 'image/png';
+            return `data:${ct};base64,${b64}`;
+        }
+        return b64;
+    } catch (err) {
+        console.error('fetchImageAsBase64 failed:', err);
+        return null;
+    }
+}
+
+export async function GET(request: Request) {
+    try {
+        if (!EVOLUTION_API_KEY) {
+            return NextResponse.json({ error: 'WhatsApp API key not configured' }, { status: 500 });
+        }
+
+        const { searchParams } = new URL(request.url);
+        const name = searchParams.get('name')?.trim();
+        const phone = searchParams.get('phone')?.trim();
+        const posterUrl = searchParams.get('posterUrl')?.trim();
+
+        if (!name || !phone) {
+            return NextResponse.json({ error: 'Missing required parameters: name, phone' }, { status: 400 });
+        }
+
+        const formattedPhone = formatPhoneNumber(phone);
+
+        const headers = {
+            'Content-Type': 'application/json',
+            apikey: EVOLUTION_API_KEY,
+        };
+
+        const caption = `Hello ${name} 👋\n\nYou are successfully registered for ${COURSE_TITLE}.\n\nProgram: ${COURSE_SUBTITLE}\nStatus: ${COURSE_MODE}\nStart: ${COURSE_DATE}\nFormat: ${COURSE_TIME}\n\nShare your personalized poster and announce your enrollment.\n\nApply link: https://muhammedmekky.com/workshop\n\n#Shopify #Ecommerce #Analytics #AI #Automation`;
+
+        let base64Media: string | null = null;
+        let imageSource = '';
+
+        if (posterUrl && posterUrl.startsWith('http')) {
+            base64Media = await fetchImageAsBase64(posterUrl, true);
+            if (base64Media) imageSource = 'og_poster';
+        }
+
+        if (base64Media) {
+            const mediaEndpoint = `${EVOLUTION_API_URL}/message/sendMedia/${EVOLUTION_INSTANCE_NAME}`;
+            const mediaPayload = {
+                number: formattedPhone,
+                mediatype: 'image',
+                mimetype: 'image/png',
+                fileName: 'shopify-architect-ticket.png',
+                caption,
+                media: base64Media,
+            };
+
+            const mediaRes = await fetch(mediaEndpoint, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify(mediaPayload),
+            });
+
+            const mediaResultText = await mediaRes.text();
+            let mediaResult;
+            try {
+                mediaResult = JSON.parse(mediaResultText);
+            } catch {
+                mediaResult = mediaResultText;
+            }
+
+            if (mediaRes.ok) {
+                return NextResponse.json({
+                    success: true,
+                    method: `image_${imageSource}`,
+                    data: mediaResult,
+                });
+            }
+        }
+
+        const textEndpoint = `${EVOLUTION_API_URL}/message/sendText/${EVOLUTION_INSTANCE_NAME}`;
+        const textRes = await fetch(textEndpoint, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+                number: formattedPhone,
+                text: caption,
+            }),
+        });
+
+        const textResult = await textRes.json();
+
+        return NextResponse.json({
+            success: textRes.ok,
+            method: 'text_fallback',
+            data: textResult,
+        });
+    } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        console.error('WhatsApp poster send failed:', message);
+        return NextResponse.json({ error: message }, { status: 500 });
+    }
+}
+
+
+============================================================
+E:\OptimaTech\CMS Vibe Mix\src\app\api\workshop\upload-photo\route.ts
+============================================================
+
+import { NextResponse } from 'next/server';
+import { createAdminClient } from '@/utils/supabase/admin';
+
+const BUCKET = 'event-uploads';
+
+export async function POST(request: Request) {
+    try {
+        const formData = await request.formData();
+        const file = formData.get('file') as File | null;
+
+        if (!file) {
+            return NextResponse.json({ error: 'No file provided' }, { status: 400 });
+        }
+
+        if (file.size > 8 * 1024 * 1024) {
+            return NextResponse.json({ error: 'File too large (max 8 MB)' }, { status: 400 });
+        }
+
+        const supabase = createAdminClient();
+
+        const ext = file.name.split('.').pop()?.toLowerCase() || 'jpg';
+        const filePath = `workshop/profile-${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+
+        const arrayBuffer = await file.arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer);
+
+        const { error: uploadError } = await supabase.storage
+            .from(BUCKET)
+            .upload(filePath, buffer, {
+                upsert: false,
+                cacheControl: '3600',
+                contentType: file.type,
+            });
+
+        if (uploadError) {
+            console.error('Server-side photo upload failed:', uploadError);
+            return NextResponse.json({ error: uploadError.message }, { status: 500 });
+        }
+
+        const { data } = supabase.storage.from(BUCKET).getPublicUrl(filePath);
+
+        return NextResponse.json({ publicUrl: data.publicUrl });
+    } catch (error) {
+        console.error('Upload route error:', error);
+        return NextResponse.json({ error: 'Upload failed' }, { status: 500 });
+    }
+}
+
+
+
