@@ -5,7 +5,9 @@ import { Resend } from 'resend'
 import { BookingConfirmation } from '@/emails/BookingConfirmation'
 
 const resend = new Resend(process.env.RESEND_API_KEY)
-const DEFAULT_CONTACT_EMAIL = 'hello@hazemabdelbaset.com'
+const DEFAULT_CONTACT_EMAIL = 'info@hazemabdelbaset.studio'
+const OWNER_FROM_EMAIL = process.env.OWNER_FROM_EMAIL || 'Hazem Portfolio <info@hazemabdelbaset.studio>'
+const CLIENT_FROM_EMAIL = process.env.CLIENT_FROM_EMAIL || 'Hazem Abdelbaset <info@hazemabdelbaset.studio>'
 
 function getOwnerEmails(): string[] {
     return (process.env.CONTACT_EMAIL || DEFAULT_CONTACT_EMAIL)
@@ -244,14 +246,14 @@ export async function submitBooking(formData: FormData) {
         }));
 
         await sendEmail({
-            from: 'Hazem Abdelbaset <hello@hazemabdelbaset.com>',
+            from: CLIENT_FROM_EMAIL,
             to: client_email,
             subject: `Booking Confirmed — ${eventType?.title || 'Meeting'}`,
             html: emailHtml
         });
 
         await sendEmail({
-            from: 'Hazem Portfolio <noreply@hazemabdelbaset.com>',
+            from: OWNER_FROM_EMAIL,
             to: getOwnerEmails(),
             subject: `New booking - ${client_name} (${booking_date} ${start_time})`,
             html: `

@@ -3,8 +3,8 @@ export const SITE = {
     title: 'Brand-led Visual Designer',
     tagline: 'Systems, not random posts.',
     subtitle: 'Clarity before aesthetics. Strategy before styling.',
-    email: 'hello@hazemabdelbaset.com',
-    url: 'https://hazemabdelbaset.com',
+    email: 'info@hazemabdelbaset.studio',
+    url: 'https://hazemabdelbaset.studio',
 };
 
 export const NAV_LINKS = [

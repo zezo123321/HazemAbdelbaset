@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "audit:admin": "node scripts/audit-admin-auth.mjs"
+    "audit:admin": "node scripts/audit-admin-auth.mjs",
+    "test:resend": "node scripts/send-resend-test.mjs"
   },
   "dependencies": {
     "@radix-ui/react-icons": "^1.3.2",

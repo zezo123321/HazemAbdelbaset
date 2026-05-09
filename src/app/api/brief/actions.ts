@@ -3,7 +3,9 @@
 import { Resend } from 'resend'
 
 const resend = new Resend(process.env.RESEND_API_KEY)
-const DEFAULT_CONTACT_EMAIL = 'hello@hazemabdelbaset.com'
+const DEFAULT_CONTACT_EMAIL = 'info@hazemabdelbaset.studio'
+const OWNER_FROM_EMAIL = process.env.OWNER_FROM_EMAIL || 'Hazem Portfolio <info@hazemabdelbaset.studio>'
+const CLIENT_FROM_EMAIL = process.env.CLIENT_FROM_EMAIL || 'Hazem Abdelbaset <info@hazemabdelbaset.studio>'
 
 interface BriefData {
   name: string
@@ -51,7 +53,7 @@ function buildBriefHtml(data: BriefData): string {
         ${row('Notes', data.notes || '')}
       </table>
       <div style="background:#f5f0e8;padding:16px 24px;font-size:12px;color:#999;text-align:center;margin-top:1px">
-        Submitted via hazemabdelbaset.com
+        Submitted via hazemabdelbaset.studio
       </div>
     </div>
   `
@@ -73,7 +75,7 @@ export async function submitBriefForm(data: BriefData): Promise<{ success?: bool
 
   try {
     await resend.emails.send({
-      from: 'Hazem Portfolio <noreply@hazemabdelbaset.com>',
+      from: OWNER_FROM_EMAIL,
       to: ownerEmails,
       subject: `Brief: ${data.name} — ${data.brandName} (${data.serviceNeeded})`,
       html: buildBriefHtml(data),
@@ -81,7 +83,7 @@ export async function submitBriefForm(data: BriefData): Promise<{ success?: bool
     })
 
     await resend.emails.send({
-      from: 'Hazem Abdelbaset <hello@hazemabdelbaset.com>',
+      from: CLIENT_FROM_EMAIL,
       to: data.email,
       subject: 'Brief Received — Let\'s Book a Meeting',
       html: `
