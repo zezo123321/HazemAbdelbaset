@@ -17,10 +17,17 @@ function getOwnerEmails(): string[] {
 }
 
 async function sendEmail(options: Parameters<typeof resend.emails.send>[0]) {
+    console.log('[Email] Sending via Resend', {
+        from: options.from,
+        to: options.to,
+        subject: options.subject,
+    })
     const result = await resend.emails.send(options)
     if (result.error) {
+        console.error('[Email] Resend returned an error', result.error)
         throw new Error(result.error.message)
     }
+    console.log('[Email] Resend accepted email', result.data)
     return result.data
 }
 
@@ -245,12 +252,22 @@ export async function submitBooking(formData: FormData) {
             meetLink: meeting_link
         }));
 
+        console.log('[Booking] Sending client confirmation email', {
+            client_email,
+            from: CLIENT_FROM_EMAIL,
+        })
+
         await sendEmail({
             from: CLIENT_FROM_EMAIL,
             to: client_email,
             subject: `Booking Confirmed — ${eventType?.title || 'Meeting'}`,
             html: emailHtml
         });
+
+        console.log('[Booking] Sending owner notification email', {
+            ownerEmails: getOwnerEmails(),
+            from: OWNER_FROM_EMAIL,
+        })
 
         await sendEmail({
             from: OWNER_FROM_EMAIL,
