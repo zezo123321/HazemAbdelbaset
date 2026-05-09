@@ -2,7 +2,6 @@
 
 import { createClient } from '@/utils/supabase/server'
 import { Resend } from 'resend'
-import { BookingConfirmation } from '@/emails/BookingConfirmation'
 
 const resend = new Resend(process.env.RESEND_API_KEY)
 const DEFAULT_CONTACT_EMAIL = 'info@hazemabdelbaset.studio'
@@ -29,6 +28,53 @@ async function sendEmail(options: Parameters<typeof resend.emails.send>[0]) {
     }
     console.log('[Email] Resend accepted email', result.data)
     return result.data
+}
+
+function getErrorMessage(error: unknown) {
+    if (error instanceof Error) return error.message
+    if (typeof error === 'string') return error
+    return 'Unknown email error'
+}
+
+function buildBookingConfirmationHtml({
+    name,
+    date,
+    time,
+    meetLink,
+}: {
+    name: string
+    date: string
+    time: string
+    meetLink: string
+}) {
+    const hasMeetLink = meetLink && meetLink !== 'Not generated yet'
+
+    return `
+        <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;padding:28px;color:#111">
+            <h1 style="font-size:24px;margin:0 0 18px">Booking Confirmed</h1>
+            <p style="font-size:15px;line-height:1.7">Hi ${name},</p>
+            <p style="font-size:15px;line-height:1.7">
+                Your strategy session is officially booked for <strong>${date} at ${time}</strong>.
+            </p>
+            ${hasMeetLink ? `
+                <p style="font-size:15px;line-height:1.7">Here is your meeting link:</p>
+                <p style="margin:28px 0">
+                    <a href="${meetLink}" style="background:#111;color:#fff;text-decoration:none;padding:12px 18px;border-radius:4px;display:inline-block">
+                        Join Google Meet
+                    </a>
+                </p>
+            ` : `
+                <p style="font-size:15px;line-height:1.7">
+                    Your meeting link is not generated yet. We will follow up with the meeting details shortly.
+                </p>
+            `}
+            <p style="font-size:15px;line-height:1.7">
+                If you need to reschedule, just reply to this email at least 24 hours in advance.
+            </p>
+            <hr style="border:none;border-top:1px solid #eee;margin:28px 0" />
+            <p style="font-size:12px;color:#666;text-align:center">Hazem Abdelbaset - Brand-Led Visual Designer</p>
+        </div>
+    `
 }
 
 export async function getActiveEventType() {
@@ -244,13 +290,12 @@ export async function submitBooking(formData: FormData) {
 
     // Send confirmation email
     try {
-        const { render } = await import('@react-email/render');
-        const emailHtml = await render(BookingConfirmation({
+        const emailHtml = buildBookingConfirmationHtml({
             name: client_name,
             date: booking_date,
             time: start_time,
             meetLink: meeting_link
-        }));
+        });
 
         console.log('[Booking] Sending client confirmation email', {
             client_email,
@@ -298,10 +343,11 @@ export async function submitBooking(formData: FormData) {
         };
     } catch (emailError: any) {
         console.error('Failed to send booking confirmation email:', emailError);
+        const emailErrorMessage = getErrorMessage(emailError)
         return {
             success: true,
             meetLink: meeting_link,
-            emailWarning: 'Booking saved, but the confirmation email could not be sent. Please copy the meeting link from this page.'
+            emailWarning: `Booking saved, but the confirmation email could not be sent: ${emailErrorMessage}`
         };
     }
 
