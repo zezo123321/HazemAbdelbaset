@@ -25,6 +25,10 @@ const cairo = Cairo({
 
 export const metadata: Metadata = {
   metadataBase: new URL(SITE.url),
+  icons: {
+    icon: '/assets/logo-icon-green.png',
+    apple: '/assets/logo-icon-green.png',
+  },
   title: 'Hazem Abdelbaset - Brand-led Visual Designer',
   description: 'Hazem Abdelbaset builds visual systems that make brands look clear, consistent, and valuable every time they show up.',
   keywords: [

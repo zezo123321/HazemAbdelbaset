@@ -1,7 +1,20 @@
 import AnimatedTextBlock from './motion/AnimatedTextBlock'
 import AnimatedCardGrid from './motion/AnimatedCardGrid'
 import AnimatedCard from './motion/AnimatedCard'
-import EditorialImage from './motion/EditorialImage'
+
+const focusedOn = [
+  'Social Media Systems',
+  'Campaign Visuals',
+  'Brand Presence Direction',
+  'Visual Identity Refinement',
+]
+
+const paragraphs = [
+  'Hazem Abdelbaset is a Brand-Led Visual Designer helping Arab brands turn scattered visual communication into clear, consistent, and recognizable visual systems.',
+  "He connects brand understanding with social media systems, campaign visuals, and visual direction — creating a presence that reflects the brand's real value.",
+  'The process starts with clarity: understand the brand, define the direction, build the system, then execute with intention.',
+  'Not random posts. A visual system that makes the brand feel intentional, consistent, and recognizable every time it shows up.',
+]
 
 export default function About() {
   return (
@@ -16,9 +29,9 @@ export default function About() {
         <AnimatedTextBlock
           style={{ display: 'flex', alignItems: 'center', gap: '1rem', marginBottom: '5rem' }}
         >
-          <span style={{ color: 'var(--accent)', fontSize: '0.68rem', letterSpacing: '0.3em', textTransform: 'uppercase' }}>(05)</span>
+          <span style={{ color: 'var(--accent)', fontSize: '0.68rem', letterSpacing: '0.3em', textTransform: 'uppercase' }}>(01)</span>
           <div style={{ width: '40px', height: '1px', backgroundColor: 'var(--t18)' }} />
-          <span style={{ color: 'var(--t28)', fontSize: '0.68rem', letterSpacing: '0.3em', textTransform: 'uppercase' }}>About</span>
+          <span style={{ color: 'var(--t28)', fontSize: '0.68rem', letterSpacing: '0.3em', textTransform: 'uppercase' }}>The Designer Behind The System</span>
         </AnimatedTextBlock>
 
         <AnimatedCardGrid
@@ -32,11 +45,26 @@ export default function About() {
         >
           {/* Column 1: Portrait */}
           <AnimatedCard>
-            <EditorialImage 
-              src="/images/hazem-portrait-01.jpg" 
-              alt="Hazem Abdelbaset Portrait"
-              aspectRatio="3/4"
-            />
+            <div
+              style={{
+                width: '100%',
+                aspectRatio: '3/4',
+                overflow: 'hidden',
+                borderRadius: '2px',
+              }}
+            >
+              <img
+                src="/assets/hazem_abdelbaset_about_section.jpg"
+                alt="Hazem Abdelbaset"
+                style={{
+                  width: '100%',
+                  height: '100%',
+                  objectFit: 'cover',
+                  objectPosition: 'top center',
+                  display: 'block',
+                }}
+              />
+            </div>
           </AnimatedCard>
 
           {/* Column 2: name + details */}
@@ -53,7 +81,7 @@ export default function About() {
                 margin: '0 0 0.75rem 0',
               }}
             >
-              Hazem<br />Abdelbaset
+              HAZEM<br />ABDELBASSET
             </h2>
             <p
               style={{
@@ -82,8 +110,9 @@ export default function About() {
                   Focused on
                 </p>
                 <ul style={{ listStyle: 'none', padding: 0, margin: 0, display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
-                  {['Social Media Systems', 'Campaign Visuals', 'Brand Identity'].map((item) => (
-                    <li key={item} style={{ color: 'var(--t70)', fontSize: '0.88rem', fontWeight: 300 }}>
+                  {focusedOn.map((item) => (
+                    <li key={item} style={{ color: 'var(--t70)', fontSize: '0.88rem', fontWeight: 300, display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                      <span style={{ color: 'var(--accent)', fontSize: '0.7rem' }}>—</span>
                       {item}
                     </li>
                   ))}
@@ -92,7 +121,7 @@ export default function About() {
             </div>
           </AnimatedCard>
 
-          {/* Right: bio text */}
+          {/* Column 3: bio text */}
           <AnimatedCard
             style={{
               borderLeft: '2px solid var(--accent)',
@@ -102,39 +131,22 @@ export default function About() {
               gap: '1.5rem',
             }}
           >
-            <p
-              style={{
-                color: 'var(--t85)',
-                fontSize: 'clamp(0.95rem, 1.4vw, 1.15rem)',
-                lineHeight: 1.85,
-                fontWeight: 400,
-                margin: 0,
-              }}
-            >
-              Hazem Abdelbaset is a Brand-Led Visual Designer focused on helping Arab brands appear as strong as they actually are.
-            </p>
-            <p
-              style={{
-                color: 'var(--t55)',
-                fontSize: 'clamp(0.88rem, 1.2vw, 1.05rem)',
-                lineHeight: 1.85,
-                fontWeight: 300,
-                margin: 0,
-              }}
-            >
-              His work connects brand understanding with social media systems, campaign visuals, and visual identity foundations — building the kind of presence that is consistent, intentional, and impossible to ignore.
-            </p>
-            <p
-              style={{
-                color: 'var(--t55)',
-                fontSize: 'clamp(0.88rem, 1.2vw, 1.05rem)',
-                lineHeight: 1.85,
-                fontWeight: 300,
-                margin: 0,
-              }}
-            >
-              The approach is always the same: understand the brand first, define the direction, build the system, then execute. Design that starts from strategy, not from aesthetics.
-            </p>
+            {paragraphs.map((text, i) => (
+              <p
+                key={i}
+                style={{
+                  color: i === 0 ? 'var(--t85)' : 'var(--t55)',
+                  fontSize: i === 0
+                    ? 'clamp(0.95rem, 1.4vw, 1.15rem)'
+                    : 'clamp(0.88rem, 1.2vw, 1.05rem)',
+                  lineHeight: 1.85,
+                  fontWeight: i === 0 ? 400 : 300,
+                  margin: 0,
+                }}
+              >
+                {text}
+              </p>
+            ))}
           </AnimatedCard>
         </AnimatedCardGrid>
       </div>

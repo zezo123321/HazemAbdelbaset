@@ -88,43 +88,25 @@ export default function Navbar() {
           margin: '0 auto',
         }}
       >
-        {/* Left: Brand monogram */}
+        {/* Left: Logo */}
         <div style={{ flex: 1, display: 'flex', justifyContent: 'flex-start' }}>
           <Link
             to="/"
             style={{
               textDecoration: 'none',
               display: 'flex',
-              alignItems: 'baseline',
-              gap: '0.05em',
+              alignItems: 'center',
             }}
           >
-            <span
+            <img
+              src="/assets/logo-light-full.png"
+              alt="Hazem Abdelbaset"
               style={{
-                color: 'var(--text)',
-                fontFamily: "'Poppins', sans-serif",
-                fontSize: '0.95rem',
-                letterSpacing: '0.22em',
-                textTransform: 'uppercase',
-                fontWeight: 600,
-                lineHeight: 1,
-                transition: 'color 0.2s ease',
+                height: '36px',
+                width: 'auto',
+                objectFit: 'contain',
               }}
-            >
-              HA
-            </span>
-            <span
-              style={{
-                color: 'var(--accent)',
-                fontFamily: "'Poppins', sans-serif",
-                fontSize: '0.95rem',
-                fontWeight: 700,
-                lineHeight: 1,
-                letterSpacing: 0,
-              }}
-            >
-              .
-            </span>
+            />
           </Link>
         </div>
 
